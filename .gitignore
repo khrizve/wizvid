@@ -1,0 +1,6 @@
+ffmpeg_bin/
+dist/
+build/
+__pycache__/
+*.pyc
+wizvid.spec

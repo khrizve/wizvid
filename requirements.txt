@@ -1,0 +1,2 @@
+PyQt6   # GUI framework for the desktop interface
+yt-dlp  # Core library for downloading media and extracting info
