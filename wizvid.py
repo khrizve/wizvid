@@ -11,6 +11,8 @@ import urllib.request
 import subprocess
 import platform
 
+from yt_dlp.utils import DownloadCancelled
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QTextEdit,
     QPushButton, QFileDialog, QProgressBar, QComboBox, QLineEdit, QFrame, QScrollArea,
@@ -23,8 +25,12 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QPixmap, QDesktopServices, QPainter, QColor, QBrush, QIcon
 
 
-class DownloadCancelledException(Exception):
-    pass
+class DownloadCancelledException(DownloadCancelled):
+    """Must subclass yt-dlp's DownloadCancelled so yt-dlp re-raises it even
+    when 'ignoreerrors' is enabled (i.e. for playlist downloads)."""
+
+
+TERMINAL_STATUSES = frozenset({'Completed', 'Failed', 'Cancelled'})
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +203,7 @@ class FfmpegSetupWorker(QObject):
 
 class DownloadWorker(QObject):
     progress_signal = pyqtSignal(dict)
+    phase_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(bool)
     error_signal = pyqtSignal(str)
     playlist_name_signal = pyqtSignal(str)
@@ -216,6 +223,7 @@ class DownloadWorker(QObject):
     def run(self):
         try:
             self.options['progress_hooks'] = [self.progress_hook]
+            self.options['postprocessor_hooks'] = [self.postprocessor_hook]
             temp_options = self.options.copy()
             temp_options['quiet'] = True
             temp_options['extract_flat'] = True
@@ -235,30 +243,53 @@ class DownloadWorker(QObject):
                             original_download_dir, safe_playlist_name, '%(title)s.%(ext)s')
                         self.options['yes_playlist'] = True
                         self.options['ignoreerrors'] = True
+            self._raise_if_cancelled()
             self.ydl_instance = yt_dlp.YoutubeDL(self.options)
             with self.ydl_instance as ydl:
                 ydl.download(self.urls)
-            self.finished_signal.emit(self.is_playlist)
-        except DownloadCancelledException:
+            if self._is_cancelled:
+                self.cancelled_signal.emit()
+            else:
+                self.finished_signal.emit(self.is_playlist)
+        except DownloadCancelled:
             self.cancelled_signal.emit()
         except Exception as e:
             self.error_signal.emit(str(e))
 
-    def progress_hook(self, d):
+    def _raise_if_cancelled(self):
         if self._is_cancelled:
             raise DownloadCancelledException('Download cancelled by user.')
+
+    def _wait_while_paused(self):
+        while self._is_paused and not self._is_cancelled:
+            time.sleep(0.1)
+
+    def progress_hook(self, d):
+        self._raise_if_cancelled()
         if self._is_paused:
-            while self._is_paused:
-                time.sleep(0.1)
-        if d['status'] in ('downloading', 'finished', 'error', 'postprocessing'):
-            self.progress_signal.emit(d)
-        return None
+            self._wait_while_paused()
+            self._raise_if_cancelled()
+        self.progress_signal.emit(dict(d))
+
+    def postprocessor_hook(self, d):
+        self._raise_if_cancelled()
+        if d.get('status') == 'started':
+            if self._is_paused:
+                self._wait_while_paused()
+                self._raise_if_cancelled()
+            self.phase_signal.emit('Converting...')
+        elif d.get('status') == 'finished':
+            self.phase_signal.emit('Downloading')
 
     def pause(self):
+        if self._is_paused or self._is_cancelled:
+            return
         self._is_paused = True
         self.paused_signal.emit()
 
     def resume(self):
+        if not self._is_paused or self._is_cancelled:
+            return
         self._is_paused = False
         self.resumed_signal.emit()
 
@@ -360,26 +391,31 @@ class DownloadTask(QObject):
         self.percent = 0.0
         self.speed = ''
         self.status = 'Queued'
+        self.started = False
         self.thread = None
         self.worker = None
 
     def start(self):
+        if self.started or self.status in TERMINAL_STATUSES:
+            return
         if self.ffmpeg_path and os.path.isfile(self.ffmpeg_path):
             self.options['ffmpeg_location'] = os.path.dirname(self.ffmpeg_path)
 
+        self.started = True
         self.thread = QThread()
         self.worker = DownloadWorker([self.url], self.options)
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
         self.worker.progress_signal.connect(self._on_progress)
+        self.worker.phase_signal.connect(self._set_status)
         self.worker.finished_signal.connect(self._on_finished)
         self.worker.error_signal.connect(self._on_error)
         self.worker.cancelled_signal.connect(self._on_cancelled)
-        self.worker.paused_signal.connect(lambda: self.status_changed.emit('Paused'))
-        self.worker.resumed_signal.connect(lambda: self.status_changed.emit('Downloading'))
+        self.worker.paused_signal.connect(lambda: self._set_status('Paused'))
+        self.worker.resumed_signal.connect(lambda: self._set_status('Downloading'))
         self.worker.playlist_name_signal.connect(
-            lambda name: self.status_changed.emit(f'Playlist: {name}'))
+            lambda name: self._set_status(f'Playlist: {name}'))
 
         self.worker.finished_signal.connect(self.thread.quit)
         self.worker.error_signal.connect(self.thread.quit)
@@ -387,12 +423,23 @@ class DownloadTask(QObject):
         self.thread.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
 
-        self.status = 'Downloading'
-        self.status_changed.emit(self.status)
+        self._set_status('Downloading')
         self.thread.start()
+
+    def _set_status(self, status):
+        if status == self.status:
+            return
+        if self.status in TERMINAL_STATUSES:
+            return
+        if self.status == 'Paused' and status not in TERMINAL_STATUSES:
+            return
+        self.status = status
+        self.status_changed.emit(status)
 
     def _on_progress(self, d):
         if d.get('status') == 'downloading':
+            if self.status == 'Converting...':
+                self._set_status('Downloading')
             percent_str = strip_ansi(d.get('_percent_str', '0.0%'))
             try:
                 percent = float(percent_str.replace('%', '').strip())
@@ -402,32 +449,46 @@ class DownloadTask(QObject):
             self.percent = percent
             self.speed = speed
             self.progress_changed.emit(percent, speed)
-        elif d.get('status') == 'postprocessing':
-            self.status_changed.emit('Converting...')
 
     def _on_finished(self, is_playlist):
+        if self.status in TERMINAL_STATUSES:
+            return
         self.status = 'Completed'
         self.percent = 100.0
         self.progress_changed.emit(100.0, '')
         self.finished.emit(True, '')
 
     def _on_error(self, message):
+        if self.status in TERMINAL_STATUSES:
+            return
         self.status = 'Failed'
         self.finished.emit(False, message)
 
     def _on_cancelled(self):
+        if self.status in TERMINAL_STATUSES:
+            return
         self.status = 'Cancelled'
         self.finished.emit(False, 'Cancelled')
 
     def pause(self):
-        if self.worker:
-            self.worker.pause()
+        if self.status in TERMINAL_STATUSES or self.status == 'Paused':
+            return
+        if not self.worker:
+            return
+        self.worker.pause()
+        self._set_status('Paused')
 
     def resume(self):
+        if self.status != 'Paused':
+            return
+        self.status = 'Downloading'
+        self.status_changed.emit(self.status)
         if self.worker:
             self.worker.resume()
 
     def cancel(self):
+        if self.status in TERMINAL_STATUSES:
+            return
         if self.worker:
             self.worker.cancel()
         else:
@@ -726,20 +787,22 @@ class DownloadItemWidget(QFrame):
         right_col.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
 
         if mode == 'active':
+            paused = task.status == 'Paused'
             self.percent_lbl = QLabel(f'{int(task.percent)}%')
             self.percent_lbl.setObjectName('itemMeta')
             self.percent_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            self.speed_lbl = QLabel(task.speed or task.status)
+            self.speed_lbl = QLabel('Paused' if paused else (task.speed or task.status))
             self.speed_lbl.setObjectName('itemMeta')
             self.speed_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
             right_col.addWidget(self.percent_lbl)
             right_col.addWidget(self.speed_lbl)
 
             btn_row = QHBoxLayout()
-            self.pause_btn = QPushButton('\u2016')
+            self.pause_btn = QPushButton('▶' if paused else '‖')
             self.pause_btn.setObjectName('iconBtn')
+            self.pause_btn.setEnabled(task.status != 'Queued')
             self.pause_btn.clicked.connect(self._toggle_pause)
-            self.cancel_btn = QPushButton('\u2715')
+            self.cancel_btn = QPushButton('✕')
             self.cancel_btn.setObjectName('iconBtn')
             self.cancel_btn.clicked.connect(self.task.cancel)
             btn_row.addWidget(self.pause_btn)
@@ -762,6 +825,8 @@ class DownloadItemWidget(QFrame):
         layout.addLayout(right_col)
 
     def _toggle_pause(self):
+        if self.task.status == 'Queued' or self.task.status in TERMINAL_STATUSES:
+            return
         if self.task.status == 'Paused':
             self.task.resume()
         else:
@@ -774,13 +839,20 @@ class DownloadItemWidget(QFrame):
             self.speed_lbl.setText(speed)
 
     def _on_status(self, status):
+        if status == 'Queued':
+            self.pause_btn.setEnabled(False)
+            self.speed_lbl.setText('Queued')
+            return
+        self.pause_btn.setEnabled(status not in TERMINAL_STATUSES)
         if status == 'Paused':
-            self.pause_btn.setText('\u25B6')
+            self.pause_btn.setText('▶')
             self.speed_lbl.setText('Paused')
-        elif status == 'Downloading':
-            self.pause_btn.setText('\u2016')
         else:
-            self.speed_lbl.setText(status)
+            self.pause_btn.setText('‖')
+            if status == 'Downloading':
+                self.speed_lbl.setText(self.task.speed or 'Starting…')
+            else:
+                self.speed_lbl.setText(status)
 
     def _open_folder(self):
         path = self.task.save_path or os.path.expanduser('~')
@@ -820,9 +892,11 @@ class VideoDownloader(QWidget):
         self.ffmpeg_path = None
         self.current_preview = None
         self.active_tasks = []
+        self.pending_tasks = []
         self.completed_tasks = []
         self.history = self._load_history()
         self.tray_icon = None
+        self._cancelling_all = False
 
         self.init_ui()
         self.apply_theme(self.theme_name)
@@ -1356,11 +1430,26 @@ class VideoDownloader(QWidget):
                 self, 'Cancel All Downloads?',
                 f'This will cancel all {len(self.active_tasks)} active download(s). Continue?')
             if resp == QMessageBox.StandardButton.Yes:
-                for task in list(self.active_tasks):
-                    task.cancel()
+                self._cancel_all_downloads()
         else:
             self.completed_tasks.clear()
             self.refresh_completed_list()
+
+    def _cancel_all_downloads(self, wait=False):
+        self._cancelling_all = True
+        try:
+            for task in list(self.active_tasks):
+                task.cancel()
+        finally:
+            self._cancelling_all = False
+        if wait:
+            for task in list(self.active_tasks):
+                thread = task.thread
+                if thread is not None:
+                    try:
+                        thread.wait(3000)
+                    except RuntimeError:
+                        pass
 
     # ------------------------------------------------------------------
     # Preview / download actions (Home)
@@ -1441,13 +1530,30 @@ class VideoDownloader(QWidget):
                              self.ffmpeg_path, self.download_path)
         task.finished.connect(lambda success, msg, t=task: self._on_task_finished(t, success, msg))
         self.active_tasks.append(task)
-        task.start()
+        if self._running_count() < self.max_concurrent:
+            task.start()
+        else:
+            self.pending_tasks.append(task)
         self.refresh_active_list()
         self._select_home_tab('active')
+
+    def _running_count(self):
+        return sum(1 for t in self.active_tasks if t.started)
+
+    def _drain_pending(self):
+        if self._cancelling_all:
+            return
+        while self.pending_tasks and self._running_count() < self.max_concurrent:
+            task = self.pending_tasks.pop(0)
+            if task.status in TERMINAL_STATUSES:
+                continue
+            task.start()
 
     def _on_task_finished(self, task, success, message):
         if task in self.active_tasks:
             self.active_tasks.remove(task)
+        if task in self.pending_tasks:
+            self.pending_tasks.remove(task)
         self.completed_tasks.insert(0, task)
 
         if self.keep_history:
@@ -1471,6 +1577,8 @@ class VideoDownloader(QWidget):
             self._notify(task.title, 'Download completed!')
         elif not success and message != 'Cancelled':
             QMessageBox.warning(self, 'Download Failed', f'{task.title}\n\n{message}')
+
+        self._drain_pending()
 
     def _notify(self, title, message):
         if self.tray_icon:
@@ -1922,6 +2030,7 @@ class VideoDownloader(QWidget):
     def _on_concurrency_changed(self, value):
         self.max_concurrent = value
         self.settings.setValue('max_concurrent', value)
+        self._drain_pending()
 
     def _on_notify_toggled(self, checked):
         self.notify_complete = checked
@@ -1975,7 +2084,7 @@ class VideoDownloader(QWidget):
         show_action = menu.addAction('Show WizVid')
         show_action.triggered.connect(self.showNormal)
         quit_action = menu.addAction('Quit')
-        quit_action.triggered.connect(QApplication.quit)
+        quit_action.triggered.connect(self.quit_app)
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(
             lambda reason: self.showNormal()
@@ -1990,7 +2099,14 @@ class VideoDownloader(QWidget):
                 'WizVid', 'Still running in the tray.',
                 QSystemTrayIcon.MessageIcon.Information, 2000)
         else:
+            if self.active_tasks:
+                self._cancel_all_downloads(wait=True)
             event.accept()
+
+    def quit_app(self):
+        if self.active_tasks:
+            self._cancel_all_downloads(wait=True)
+        QApplication.quit()
 
 
 if __name__ == '__main__':
