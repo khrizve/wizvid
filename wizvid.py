@@ -22,7 +22,7 @@ from PyQt6.QtCore import (
     Qt, QUrl, QThread, pyqtSignal, QObject, QSettings, QVariantAnimation,
     QEasingCurve, QRectF,
 )
-from PyQt6.QtGui import QPixmap, QDesktopServices, QPainter, QColor, QBrush, QIcon
+from PyQt6.QtGui import QPixmap, QDesktopServices, QPainter, QPainterPath, QColor, QBrush, QIcon
 
 
 class DownloadCancelledException(DownloadCancelled):
@@ -568,8 +568,6 @@ def build_stylesheet(t):
             background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {t['accent1']}, stop:1 {t['bg2']});
             border: 1px solid {t['border']};
         }}
-        QLabel#bannerTitle {{ font-size: 24px; font-weight: 700; color: #ffffff; }}
-        QLabel#bannerSubtitle {{ font-size: 12px; color: #ffffffcc; }}
         QLabel#pageTitle {{ font-size: 24px; font-weight: 700; color: {t['text']}; }}
         QLineEdit, QTextEdit {{
             background-color: {t['input_bg']};
@@ -687,14 +685,43 @@ def make_placeholder_pixmap(w, h, emoji='\U0001F3AC'):
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(QBrush(QColor('#232c4d')))
-    painter.drawRoundedRect(0, 0, w, h, 10, 10)
+    painter.drawRoundedRect(pixmap.rect(), 10, 10)
     font = painter.font()
-    font.setPointSize(max(8, int(min(w, h) * 0.4)))
+    font.setPointSize(max(8, int(min(w, h) / 6)))
     painter.setFont(font)
     painter.setPen(QColor('#8a93b8'))
     painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, emoji)
     painter.end()
     return pixmap
+
+
+class BannerWidget(QFrame):
+    """Banner frame that cover-fills itself with an image (uniform scale,
+    centered, cropped overflow) and keeps the stylesheet's rounded corners."""
+
+    def __init__(self, image_path, parent=None):
+        super().__init__(parent)
+        self.setObjectName('banner')
+        self._banner_pixmap = QPixmap(image_path)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._banner_pixmap.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(self.rect()), 18, 18)
+        painter.setClipPath(clip)
+        scaled = self._banner_pixmap.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation)
+        painter.drawPixmap(
+            (self.width() - scaled.width()) // 2,
+            (self.height() - scaled.height()) // 2,
+            scaled)
+        painter.end()
 
 
 # ---------------------------------------------------------------------------
@@ -1059,7 +1086,7 @@ class VideoDownloader(QWidget):
         logo_row.addWidget(logo_icon)
         logo_text = QVBoxLayout()
         logo_text.setSpacing(0)
-        title = QLabel('WizVid')
+        title = QLabel('Wiz<span style="color:#8b5cf6;">Vid</span>')
         title.setObjectName('logoTitle')
         subtitle = QLabel('FANTASY DOWNLOADER')
         subtitle.setObjectName('logoSubtitle')
@@ -1220,18 +1247,10 @@ class VideoDownloader(QWidget):
         layout = QVBoxLayout(content)
         layout.setSpacing(18)
 
-        banner = QFrame()
-        banner.setObjectName('banner')
+        banner_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'assets', 'wizvid_banner1.png')
+        banner = BannerWidget(banner_path)
         banner.setFixedHeight(120)
-        b_layout = QVBoxLayout(banner)
-        b_layout.setContentsMargins(28, 20, 28, 20)
-        b_title = QLabel('Download Your Favorite Videos')
-        b_title.setObjectName('bannerTitle')
-        b_sub = QLabel('Any Platform  \u2022  Any Format  \u2022  Anytime')
-        b_sub.setObjectName('bannerSubtitle')
-        b_layout.addWidget(b_title)
-        b_layout.addWidget(b_sub)
-        b_layout.addStretch()
         layout.addWidget(banner)
 
         columns = QHBoxLayout()
