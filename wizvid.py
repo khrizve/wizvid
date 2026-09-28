@@ -19,8 +19,8 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QSpinBox, QMessageBox, QSystemTrayIcon, QMenu, QAbstractButton,
 )
 from PyQt6.QtCore import (
-    Qt, QUrl, QThread, pyqtSignal, QObject, QSettings, QPropertyAnimation,
-    QEasingCurve, QRectF, pyqtProperty,
+    Qt, QUrl, QThread, pyqtSignal, QObject, QSettings, QVariantAnimation,
+    QEasingCurve, QRectF,
 )
 from PyQt6.QtGui import QPixmap, QDesktopServices, QPainter, QColor, QBrush, QIcon
 
@@ -539,6 +539,9 @@ def build_stylesheet(t):
         QWidget#root {{
             background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {t['bg1']}, stop:1 {t['bg2']});
         }}
+        QDialog, QMessageBox {{
+            background-color: {t['panel']};
+        }}
         QWidget#sidebar {{
             background-color: {t['sidebar']};
             border-right: 1px solid {t['border']};
@@ -706,9 +709,10 @@ class ToggleSwitch(QAbstractButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(44, 24)
         self._knob_pos = 23.0 if checked else 3.0
-        self._anim = QPropertyAnimation(self, b'knob_pos', self)
+        self._anim = QVariantAnimation(self)
         self._anim.setDuration(150)
         self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._anim.valueChanged.connect(self._on_knob_moved)
         self.toggled.connect(self._animate)
         self._on_color = QColor('#8b5cf6')
         self._off_color = QColor('#2a3358')
@@ -719,14 +723,9 @@ class ToggleSwitch(QAbstractButton):
         self._anim.setEndValue(23.0 if checked else 3.0)
         self._anim.start()
 
-    def get_knob_pos(self):
-        return self._knob_pos
-
-    def set_knob_pos(self, value):
-        self._knob_pos = value
+    def _on_knob_moved(self, value):
+        self._knob_pos = float(value)
         self.update()
-
-    knob_pos = pyqtProperty(float, get_knob_pos, set_knob_pos)
 
     def paintEvent(self, event):
         painter = QPainter(self)
