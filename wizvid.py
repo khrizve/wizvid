@@ -20,9 +20,10 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QUrl, QThread, pyqtSignal, QObject, QSettings, QVariantAnimation,
-    QEasingCurve, QRectF,
+    QEasingCurve, QRectF, QByteArray, QSize,
 )
 from PyQt6.QtGui import QPixmap, QDesktopServices, QPainter, QPainterPath, QColor, QBrush, QIcon
+from PyQt6.QtSvg import QSvgRenderer
 
 
 class DownloadCancelledException(DownloadCancelled):
@@ -678,7 +679,127 @@ def build_stylesheet(t):
     """
 
 
-def make_placeholder_pixmap(w, h, emoji='\U0001F3AC'):
+# ---------------------------------------------------------------------------
+# SVG icon helpers (assets/icons/*.svg)
+# ---------------------------------------------------------------------------
+
+ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'icons')
+_icon_cache = {}
+CURRENT_THEME = THEMES['Fantasy Purple']
+
+
+def _resolve_color(color):
+    """Map a theme key ('text', 'muted', 'danger', ...) or '#rrggbb' to a hex."""
+    if not color:
+        return None
+    if color.startswith('#'):
+        return color
+    return CURRENT_THEME.get(color, color)
+
+
+def icon_pixmap(name, size=20, color=None):
+    """Load assets/icons/<name>.svg and render it at `size` x `size`.
+
+    `color` may be a '#rrggbb' literal (already resolved); it replaces the
+    SVG's currentColor (Lucide/Tabler are stroke-based). Brand icons pass
+    color=None and keep their baked-in colors.
+    """
+    key = (name, size, color)
+    if key in _icon_cache:
+        return _icon_cache[key]
+    path = os.path.join(ICONS_DIR, f'{name}.svg')
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            svg = fh.read()
+        if color:
+            svg = svg.replace('currentColor', color)
+        renderer = QSvgRenderer(QByteArray(svg.encode('utf-8')))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        renderer.render(painter)
+        painter.end()
+    except Exception:
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+    _icon_cache[key] = pixmap
+    return pixmap
+
+
+def apply_widget_icon(w):
+    """(Re-)apply the icon stored in a widget's wiz_icon* properties."""
+    name = w.property('wiz_icon')
+    if not name:
+        return
+    size = int(w.property('wiz_icon_size') or 16)
+    color = w.property('wiz_icon_color')
+    checked_color = w.property('wiz_icon_checked_color')
+    if checked_color and isinstance(w, QAbstractButton) and w.isChecked():
+        color = checked_color
+    pm = icon_pixmap(name, size, _resolve_color(color))
+    if isinstance(w, QLabel):
+        w.setPixmap(pm)
+    else:
+        w.setIcon(QIcon(pm))
+        w.setIconSize(QSize(size, size))
+
+
+def set_btn_icon(btn, name, size=16, color='text', checked_color=None):
+    btn.setProperty('wiz_icon', name)
+    btn.setProperty('wiz_icon_size', size)
+    btn.setProperty('wiz_icon_color', color)
+    if checked_color:
+        btn.setProperty('wiz_icon_checked_color', checked_color)
+        if not btn.property('wiz_icon_hooked'):
+            btn.setProperty('wiz_icon_hooked', True)
+            btn.toggled.connect(lambda _=False, b=btn: apply_widget_icon(b))
+    apply_widget_icon(btn)
+
+
+def icon_text(name, text, size=16, color='text', object_name=None):
+    """A small widget with an icon followed by a text label."""
+    widget = QWidget()
+    row = QHBoxLayout(widget)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(8)
+    icon_lbl = QLabel()
+    icon_lbl.setProperty('wiz_icon', name)
+    icon_lbl.setProperty('wiz_icon_size', size)
+    icon_lbl.setProperty('wiz_icon_color', color)
+    apply_widget_icon(icon_lbl)
+    row.addWidget(icon_lbl)
+    text_lbl = QLabel(text)
+    if object_name:
+        text_lbl.setObjectName(object_name)
+    row.addWidget(text_lbl)
+    row.addStretch()
+    return widget
+
+
+def logo_pixmap(size=24):
+    """App logo: accent-colored rounded badge with a white wand glyph."""
+    color = _resolve_color('accent1')
+    key = ('__logo__', size, color)
+    if key in _icon_cache:
+        return _icon_cache[key]
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(QColor(color)))
+    painter.drawRoundedRect(pixmap.rect(), size * 0.25, size * 0.25)
+    glyph = int(size * 0.68)
+    painter.drawPixmap(
+        (size - glyph) // 2, (size - glyph) // 2,
+        icon_pixmap('wand-sparkles', glyph, '#ffffff'))
+    painter.end()
+    _icon_cache[key] = pixmap
+    return pixmap
+
+
+def make_placeholder_pixmap(w, h, icon_name='film'):
     pixmap = QPixmap(w, h)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
@@ -686,11 +807,9 @@ def make_placeholder_pixmap(w, h, emoji='\U0001F3AC'):
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(QBrush(QColor('#232c4d')))
     painter.drawRoundedRect(pixmap.rect(), 10, 10)
-    font = painter.font()
-    font.setPointSize(max(8, int(min(w, h) / 6)))
-    painter.setFont(font)
-    painter.setPen(QColor('#8a93b8'))
-    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, emoji)
+    icon_size = max(16, int(min(w, h) * 0.45))
+    icon_pm = icon_pixmap(icon_name, icon_size, _resolve_color('muted'))
+    painter.drawPixmap((w - icon_size) // 2, (h - icon_size) // 2, icon_pm)
     painter.end()
     return pixmap
 
@@ -824,12 +943,14 @@ class DownloadItemWidget(QFrame):
             right_col.addWidget(self.speed_lbl)
 
             btn_row = QHBoxLayout()
-            self.pause_btn = QPushButton('▶' if paused else '‖')
+            self.pause_btn = QPushButton()
             self.pause_btn.setObjectName('iconBtn')
+            set_btn_icon(self.pause_btn, 'play' if paused else 'pause', 14, 'text')
             self.pause_btn.setEnabled(task.status != 'Queued')
             self.pause_btn.clicked.connect(self._toggle_pause)
-            self.cancel_btn = QPushButton('✕')
+            self.cancel_btn = QPushButton()
             self.cancel_btn.setObjectName('iconBtn')
+            set_btn_icon(self.cancel_btn, 'x', 14, 'text')
             self.cancel_btn.clicked.connect(self.task.cancel)
             btn_row.addWidget(self.pause_btn)
             btn_row.addWidget(self.cancel_btn)
@@ -839,11 +960,13 @@ class DownloadItemWidget(QFrame):
             task.status_changed.connect(self._on_status)
         else:
             status_text = 'Completed' if task.status == 'Completed' else task.status
-            icon = '\u2705' if task.status == 'Completed' else '\u274C'
-            status_lbl = QLabel(f'{icon} {status_text}')
-            status_lbl.setObjectName('itemMeta')
-            right_col.addWidget(status_lbl)
-            open_btn = QPushButton('\U0001F4C2 Open')
+            if task.status == 'Completed':
+                status_w = icon_text('circle-check', status_text, 14, '#22c55e', 'itemMeta')
+            else:
+                status_w = icon_text('circle-x', status_text, 14, '#ef4444', 'itemMeta')
+            right_col.addWidget(status_w)
+            open_btn = QPushButton(' Open')
+            set_btn_icon(open_btn, 'folder-open', 14, 'text')
             open_btn.setMinimumWidth(80)
             open_btn.clicked.connect(self._open_folder)
             right_col.addWidget(open_btn)
@@ -871,10 +994,10 @@ class DownloadItemWidget(QFrame):
             return
         self.pause_btn.setEnabled(status not in TERMINAL_STATUSES)
         if status == 'Paused':
-            self.pause_btn.setText('▶')
+            set_btn_icon(self.pause_btn, 'play', 14, 'text')
             self.speed_lbl.setText('Paused')
         else:
-            self.pause_btn.setText('‖')
+            set_btn_icon(self.pause_btn, 'pause', 14, 'text')
             if status == 'Downloading':
                 self.speed_lbl.setText(self.task.speed or 'Starting…')
             else:
@@ -1081,8 +1204,9 @@ class VideoDownloader(QWidget):
         layout.setSpacing(6)
 
         logo_row = QHBoxLayout()
-        logo_icon = QLabel('\U0001F9D9\u200D\u2640\uFE0F')
-        logo_icon.setStyleSheet('font-size: 24px;')
+        logo_icon = QLabel()
+        logo_icon.setProperty('wiz_logo', 24)
+        logo_icon.setPixmap(logo_pixmap(24))
         logo_row.addWidget(logo_icon)
         logo_text = QVBoxLayout()
         logo_text.setSpacing(0)
@@ -1099,16 +1223,17 @@ class VideoDownloader(QWidget):
 
         self.nav_buttons = {}
         nav_items = [
-            ('home', '\U0001F3E0', 'Home'),
-            ('downloads', '\U0001F4E5', 'Downloads'),
-            ('history', '\U0001F551', 'History'),
-            ('settings', '\u2699', 'Settings'),
+            ('home', 'house', 'Home'),
+            ('downloads', 'inbox', 'Downloads'),
+            ('history', 'history', 'History'),
+            ('settings', 'settings', 'Settings'),
         ]
-        for key, icon, label in nav_items:
-            btn = QPushButton(f'   {icon}   {label}')
+        for key, icon_name, label in nav_items:
+            btn = QPushButton(label)
             btn.setObjectName('navButton')
-            btn.setCheckable(True)
             btn.setFixedHeight(44)
+            set_btn_icon(btn, icon_name, 17, 'text', checked_color='#ffffff')
+            btn.setCheckable(True)
             btn.clicked.connect(lambda checked, k=key: self.switch_page(k))
             layout.addWidget(btn)
             self.nav_buttons[key] = btn
@@ -1177,13 +1302,16 @@ class VideoDownloader(QWidget):
             for i, task in enumerate(tasks):
                 layout.insertWidget(i, DownloadItemWidget(task, mode))
 
-    def _quick_row(self, icon, title, subtitle, action_widget):
+    def _quick_row(self, icon_name, title, subtitle, action_widget):
         row = QFrame()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(10)
-        icon_lbl = QLabel(icon)
-        icon_lbl.setStyleSheet('font-size: 16px;')
+        icon_lbl = QLabel()
+        icon_lbl.setProperty('wiz_icon', icon_name)
+        icon_lbl.setProperty('wiz_icon_size', 16)
+        icon_lbl.setProperty('wiz_icon_color', 'text')
+        apply_widget_icon(icon_lbl)
         h.addWidget(icon_lbl)
         text_col = QVBoxLayout()
         text_col.setSpacing(0)
@@ -1225,8 +1353,9 @@ class VideoDownloader(QWidget):
         return col
 
     def _make_chevron_btn(self, callback):
-        btn = QPushButton('\u203A')
+        btn = QPushButton()
         btn.setObjectName('iconBtn')
+        set_btn_icon(btn, 'chevron-right', 14, 'muted')
         btn.clicked.connect(callback)
         return btn
 
@@ -1263,12 +1392,21 @@ class VideoDownloader(QWidget):
 
         url_row = QHBoxLayout()
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText('\U0001F517  Paste video URL here...')
+        self.url_input.setPlaceholderText('Paste video URL here...')
         self.url_input.setFixedHeight(46)
+        self.url_input.setTextMargins(34, 0, 10, 0)
         self.url_input.returnPressed.connect(self.parse_url)
+        url_icon = QLabel(self.url_input)
+        url_icon.setProperty('wiz_icon', 'link')
+        url_icon.setProperty('wiz_icon_size', 16)
+        url_icon.setProperty('wiz_icon_color', 'muted')
+        apply_widget_icon(url_icon)
+        url_icon.move(12, (46 - 16) // 2)
+        url_icon.show()
         url_row.addWidget(self.url_input, 1)
-        self.parse_btn = QPushButton('\u2728 Parse')
+        self.parse_btn = QPushButton('Parse')
         self.parse_btn.setObjectName('primaryBtn')
+        set_btn_icon(self.parse_btn, 'sparkles', 15, '#ffffff')
         self.parse_btn.setFixedHeight(46)
         self.parse_btn.setFixedWidth(130)
         self.parse_btn.clicked.connect(self.parse_url)
@@ -1322,15 +1460,17 @@ class VideoDownloader(QWidget):
         self.path_field = QLineEdit(self.download_path)
         self.path_field.setReadOnly(True)
         path_row.addWidget(self.path_field, 1)
-        folder_btn = QPushButton('\U0001F4C2')
+        folder_btn = QPushButton()
         folder_btn.setObjectName('iconBtn')
+        set_btn_icon(folder_btn, 'folder-open', 15, 'text')
         folder_btn.clicked.connect(self.select_folder)
         path_row.addWidget(folder_btn)
         save_row.addLayout(path_row)
         left_col.addLayout(save_row)
 
-        download_btn = QPushButton('\u2B07  Download Now')
+        download_btn = QPushButton('  Download Now')
         download_btn.setObjectName('primaryBtn')
+        set_btn_icon(download_btn, 'download', 17, '#ffffff')
         download_btn.setFixedHeight(48)
         download_btn.clicked.connect(self.start_download_from_home)
         left_col.addWidget(download_btn)
@@ -1348,8 +1488,9 @@ class VideoDownloader(QWidget):
         tabs_row.addWidget(self.active_tab_btn)
         tabs_row.addWidget(self.completed_tab_btn)
         tabs_row.addStretch()
-        clear_all_btn = QPushButton('\U0001F5D1 Clear All')
+        clear_all_btn = QPushButton(' Clear All')
         clear_all_btn.setObjectName('dangerBtn')
+        set_btn_icon(clear_all_btn, 'trash', 14, 'danger')
         clear_all_btn.clicked.connect(self.clear_home_tab)
         tabs_row.addWidget(clear_all_btn)
         left_col.addLayout(tabs_row)
@@ -1376,23 +1517,26 @@ class VideoDownloader(QWidget):
         panel.setObjectName('panel')
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(16, 16, 16, 16)
-        title = QLabel('\U0001F52E Supported Platforms')
-        title.setObjectName('panelTitle')
+        title = icon_text('globe', 'Supported Platforms', 17, 'accent1', 'panelTitle')
         layout.addWidget(title)
         grid = QGridLayout()
         grid.setSpacing(10)
         platforms = [
-            ('\u25B6\uFE0F', 'YouTube'), ('\U0001F3B5', 'TikTok'), ('\U0001F4F7', 'Instagram'),
-            ('\U0001F426', 'Twitter / X'), ('\U0001F4D8', 'Facebook'), ('\u22EF', 'More...'),
+            ('youtube', 'YouTube'), ('tiktok', 'TikTok'), ('instagram', 'Instagram'),
+            ('x-twitter', 'Twitter / X'), ('facebook', 'Facebook'), ('ellipsis', 'More...'),
         ]
-        for i, (icon, name) in enumerate(platforms):
+        for i, (icon_name, name) in enumerate(platforms):
             item = QFrame()
             item.setObjectName('downloadItem')
             v = QVBoxLayout(item)
             v.setContentsMargins(10, 10, 10, 10)
             v.setSpacing(4)
-            icon_lbl = QLabel(icon)
-            icon_lbl.setStyleSheet('font-size: 18px;')
+            icon_lbl = QLabel()
+            icon_lbl.setProperty('wiz_icon', icon_name)
+            icon_lbl.setProperty('wiz_icon_size', 22)
+            if icon_name == 'ellipsis':
+                icon_lbl.setProperty('wiz_icon_color', 'muted')
+            apply_widget_icon(icon_lbl)
             icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             name_lbl = QLabel(name)
             name_lbl.setObjectName('itemMeta')
@@ -1409,29 +1553,28 @@ class VideoDownloader(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
-        title = QLabel('\u26A1 Quick Settings')
-        title.setObjectName('panelTitle')
+        title = icon_text('zap', 'Quick Settings', 17, 'accent1', 'panelTitle')
         layout.addWidget(title)
 
         self.qs_folder_label = QLabel(self._short_path(self.download_path))
         layout.addWidget(self._quick_row(
-            '\U0001F4C1', 'Download Folder', self.qs_folder_label,
+            'folder', 'Download Folder', self.qs_folder_label,
             self._make_chevron_btn(self.select_folder)))
 
         self.qs_format_combo = QComboBox()
         self.qs_format_combo.addItems(['MP4', 'MP3'])
         self.qs_format_combo.setCurrentText('MP4' if 'MP4' in self.default_format else 'MP3')
         self.qs_format_combo.currentTextChanged.connect(self._on_quick_format_changed)
-        layout.addWidget(self._quick_row('\U0001F39E', 'Default Format', None, self.qs_format_combo))
+        layout.addWidget(self._quick_row('film', 'Default Format', None, self.qs_format_combo))
 
         self.auto_convert_toggle = ToggleSwitch(checked=self.auto_convert)
         self.auto_convert_toggle.toggled.connect(self._on_auto_convert_toggled)
-        layout.addWidget(self._quick_row('\U0001F501', 'Auto Convert', None, self.auto_convert_toggle))
+        layout.addWidget(self._quick_row('refresh-cw', 'Auto Convert', None, self.auto_convert_toggle))
 
         self.multi_thread_toggle = ToggleSwitch(checked=self.multi_threading)
         self.multi_thread_toggle.toggled.connect(self._on_multi_thread_toggled)
         layout.addWidget(self._quick_row(
-            '\U0001F9F5', 'Multi-Threading', '(Faster downloads)', self.multi_thread_toggle))
+            'layers', 'Multi-Threading', '(Faster downloads)', self.multi_thread_toggle))
 
         return panel
 
@@ -1494,7 +1637,7 @@ class VideoDownloader(QWidget):
 
     def _on_preview_ready(self, info):
         self.parse_btn.setEnabled(True)
-        self.parse_btn.setText('\u2728 Parse')
+        self.parse_btn.setText('Parse')
         self.current_preview = info
         if 'thumbnail_data' in info:
             pixmap = QPixmap()
@@ -1515,7 +1658,7 @@ class VideoDownloader(QWidget):
 
     def _on_preview_error(self, error):
         self.parse_btn.setEnabled(True)
-        self.parse_btn.setText('\u2728 Parse')
+        self.parse_btn.setText('Parse')
         QMessageBox.critical(self, 'Preview Error', f'Failed to fetch preview:\n{error}')
 
     def start_download_from_home(self):
@@ -1642,8 +1785,7 @@ class VideoDownloader(QWidget):
         bc = QVBoxLayout(batch_card)
         bc.setContentsMargins(16, 16, 16, 16)
         bc.setSpacing(10)
-        bc_title = QLabel('\u2795 Add URLs to Queue')
-        bc_title.setObjectName('panelTitle')
+        bc_title = icon_text('plus', 'Add URLs to Queue', 15, 'accent1', 'panelTitle')
         bc.addWidget(bc_title)
         self.batch_input = QTextEdit()
         self.batch_input.setPlaceholderText('Paste one or more video URLs, one per line...')
@@ -1660,8 +1802,9 @@ class VideoDownloader(QWidget):
             options_row, 'Audio', self.AUDIO_OPTIONS, self.default_audio)
         bc.addLayout(options_row)
 
-        add_btn = QPushButton('\u2B07  Add to Queue && Start')
+        add_btn = QPushButton('  Add to Queue && Start')
         add_btn.setObjectName('primaryBtn')
+        set_btn_icon(add_btn, 'download', 15, '#ffffff')
         add_btn.clicked.connect(self._start_batch_download)
         bc.addWidget(add_btn)
         layout.addWidget(batch_card)
@@ -1704,8 +1847,9 @@ class VideoDownloader(QWidget):
         header.setObjectName('pageTitle')
         header_row.addWidget(header)
         header_row.addStretch()
-        clear_btn = QPushButton('\U0001F5D1 Clear All')
+        clear_btn = QPushButton(' Clear All')
         clear_btn.setObjectName('dangerBtn')
+        set_btn_icon(clear_btn, 'trash', 14, 'danger')
         clear_btn.clicked.connect(self._clear_history)
         header_row.addWidget(clear_btn)
         layout.addLayout(header_row)
@@ -1741,8 +1885,12 @@ class VideoDownloader(QWidget):
         row.setObjectName('downloadItem')
         h = QHBoxLayout(row)
         h.setContentsMargins(12, 12, 12, 12)
-        icon = QLabel('\u2705' if entry.get('status') == 'Completed' else '\u274C')
-        icon.setStyleSheet('font-size: 18px;')
+        completed = entry.get('status') == 'Completed'
+        icon = QLabel()
+        icon.setProperty('wiz_icon', 'circle-check' if completed else 'circle-x')
+        icon.setProperty('wiz_icon_size', 16)
+        icon.setProperty('wiz_icon_color', '#22c55e' if completed else '#ef4444')
+        apply_widget_icon(icon)
         h.addWidget(icon)
         info = QVBoxLayout()
         title = QLabel(entry.get('title', 'Untitled'))
@@ -1753,8 +1901,9 @@ class VideoDownloader(QWidget):
         info.addWidget(title)
         info.addWidget(meta)
         h.addLayout(info, 1)
-        open_btn = QPushButton('\U0001F4C2')
+        open_btn = QPushButton()
         open_btn.setObjectName('iconBtn')
+        set_btn_icon(open_btn, 'folder-open', 15, 'text')
         path = entry.get('path') or os.path.expanduser('~')
         open_btn.clicked.connect(lambda checked=False, p=path: QDesktopServices.openUrl(QUrl.fromLocalFile(p)))
         h.addWidget(open_btn)
@@ -1796,8 +1945,7 @@ class VideoDownloader(QWidget):
         ac = QVBoxLayout(appearance_card)
         ac.setContentsMargins(18, 18, 18, 18)
         ac.setSpacing(12)
-        ac_title = QLabel('\U0001F3A8 Appearance')
-        ac_title.setObjectName('sectionTitle')
+        ac_title = icon_text('palette', 'Appearance', 15, 'accent1', 'sectionTitle')
         ac.addWidget(ac_title)
         theme_row = QHBoxLayout()
         theme_row.setSpacing(10)
@@ -1818,15 +1966,15 @@ class VideoDownloader(QWidget):
         dc = QVBoxLayout(dl_card)
         dc.setContentsMargins(18, 18, 18, 18)
         dc.setSpacing(14)
-        dc_title = QLabel('\u2B07 Downloads')
-        dc_title.setObjectName('sectionTitle')
+        dc_title = icon_text('download', 'Downloads', 15, 'accent1', 'sectionTitle')
         dc.addWidget(dc_title)
 
         folder_row = QHBoxLayout()
         self.settings_path_field = QLineEdit(self.download_path)
         self.settings_path_field.setReadOnly(True)
         folder_row.addWidget(self.settings_path_field, 1)
-        browse_btn = QPushButton('\U0001F4C2 Browse')
+        browse_btn = QPushButton(' Browse')
+        set_btn_icon(browse_btn, 'folder-open', 14, 'text')
         browse_btn.clicked.connect(self.select_folder)
         folder_row.addWidget(browse_btn)
         dc.addLayout(self._settings_field_row('Default Download Folder', folder_row))
@@ -1876,8 +2024,7 @@ class VideoDownloader(QWidget):
         beh = QVBoxLayout(beh_card)
         beh.setContentsMargins(18, 18, 18, 18)
         beh.setSpacing(14)
-        beh_title = QLabel('\U0001F514 Behavior')
-        beh_title.setObjectName('sectionTitle')
+        beh_title = icon_text('bell', 'Behavior', 15, 'accent1', 'sectionTitle')
         beh.addWidget(beh_title)
 
         self.notify_toggle = ToggleSwitch(checked=self.notify_complete)
@@ -1906,8 +2053,7 @@ class VideoDownloader(QWidget):
         hc = QVBoxLayout(hist_card)
         hc.setContentsMargins(18, 18, 18, 18)
         hc.setSpacing(14)
-        hc_title = QLabel('\U0001F551 History')
-        hc_title.setObjectName('sectionTitle')
+        hc_title = icon_text('history', 'History', 15, 'accent1', 'sectionTitle')
         hc.addWidget(hc_title)
 
         self.keep_history_toggle = ToggleSwitch(checked=self.keep_history)
@@ -1930,8 +2076,9 @@ class VideoDownloader(QWidget):
         retention_row.addWidget(self.retention_combo)
         hc.addLayout(retention_row)
 
-        clear_hist_btn = QPushButton('\U0001F5D1 Clear History Now')
+        clear_hist_btn = QPushButton(' Clear History Now')
         clear_hist_btn.setObjectName('dangerBtn')
+        set_btn_icon(clear_hist_btn, 'trash', 14, 'danger')
         clear_hist_btn.clicked.connect(self._clear_history)
         hc.addWidget(clear_hist_btn)
 
@@ -1943,20 +2090,36 @@ class VideoDownloader(QWidget):
         abt = QVBoxLayout(about_card)
         abt.setContentsMargins(18, 18, 18, 18)
         abt.setSpacing(10)
-        abt_title = QLabel('\u2139\uFE0F About')
-        abt_title.setObjectName('sectionTitle')
+        abt_title = icon_text('info', 'About', 15, 'accent1', 'sectionTitle')
         abt.addWidget(abt_title)
-        version_lbl = QLabel('WizVid v2.0 \u2014 Made with \U0001F49C for dreamers')
+        version_row = QHBoxLayout()
+        version_row.setSpacing(4)
+        version_lbl = QLabel('WizVid v2.0 — Made with')
         version_lbl.setObjectName('muted')
-        abt.addWidget(version_lbl)
+        version_row.addWidget(version_lbl)
+        heart_lbl = QLabel()
+        heart_lbl.setProperty('wiz_icon', 'heart')
+        heart_lbl.setProperty('wiz_icon_size', 13)
+        heart_lbl.setProperty('wiz_icon_color', 'accent1')
+        apply_widget_icon(heart_lbl)
+        version_row.addWidget(heart_lbl)
+        version_tail = QLabel('for dreamers')
+        version_tail.setObjectName('muted')
+        version_row.addWidget(version_tail)
+        version_row.addStretch()
+        version_wrap = QWidget()
+        version_wrap.setLayout(version_row)
+        abt.addWidget(version_wrap)
         credit_lbl = QLabel('<a href="https://rizve.netlify.app/" style="color:#8b5cf6;">Visit creator\'s page</a>')
         credit_lbl.setOpenExternalLinks(True)
         abt.addWidget(credit_lbl)
         about_btns = QHBoxLayout()
-        check_update_btn = QPushButton('\U0001F504 Check for yt-dlp Updates')
+        check_update_btn = QPushButton(' Check for yt-dlp Updates')
+        set_btn_icon(check_update_btn, 'refresh-cw', 14, 'text')
         check_update_btn.clicked.connect(self._start_ytdlp_update_check)
-        reset_btn = QPushButton('\u267B Reset All Settings')
+        reset_btn = QPushButton(' Reset All Settings')
         reset_btn.setObjectName('dangerBtn')
+        set_btn_icon(reset_btn, 'rotate-ccw', 14, 'danger')
         reset_btn.clicked.connect(self._reset_settings)
         about_btns.addWidget(check_update_btn)
         about_btns.addWidget(reset_btn)
@@ -1975,10 +2138,29 @@ class VideoDownloader(QWidget):
             return
         self.theme_name = name
         self.settings.setValue('theme_name', name)
+        global CURRENT_THEME
+        CURRENT_THEME = THEMES[name]
+        _icon_cache.clear()
         self.setStyleSheet(build_stylesheet(THEMES[name]))
         if hasattr(self, 'theme_buttons'):
             for n, btn in self.theme_buttons.items():
                 btn.setChecked(n == name)
+        self._refresh_icons()
+
+    def _refresh_icons(self):
+        """Re-tint every icon widget after a theme change."""
+        for w in self.findChildren(QWidget):
+            if w.property('wiz_icon'):
+                apply_widget_icon(w)
+            elif w.property('wiz_logo'):
+                w.setPixmap(logo_pixmap(int(w.property('wiz_logo'))))
+        if hasattr(self, 'home_active_layout'):
+            self.refresh_active_list()
+            self.refresh_completed_list()
+        if hasattr(self, 'history_layout'):
+            self.refresh_history_list()
+        if self.tray_icon is not None:
+            self.tray_icon.setIcon(QIcon(logo_pixmap(64)))
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Select Download Folder', self.download_path)
@@ -2096,7 +2278,7 @@ class VideoDownloader(QWidget):
     def _setup_tray_icon(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        icon_pixmap = make_placeholder_pixmap(32, 32, '\U0001F9D9')
+        icon_pixmap = logo_pixmap(64)
         self.tray_icon = QSystemTrayIcon(QIcon(icon_pixmap), self)
         menu = QMenu()
         show_action = menu.addAction('Show WizVid')
