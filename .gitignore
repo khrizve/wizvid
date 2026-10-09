@@ -4,3 +4,7 @@ build/
 __pycache__/
 *.pyc
 wizvid.spec
+
+# Debian packaging (local only)
+packaging/
+*.deb

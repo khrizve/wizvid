@@ -38,6 +38,22 @@ TERMINAL_STATUSES = frozenset({'Completed', 'Failed', 'Cancelled'})
 # yt-dlp version checker / auto-updater
 # ---------------------------------------------------------------------------
 
+def _ytdlp_system_vendor_dir():
+    """Directory the .deb package bundles yt-dlp into."""
+    return '/usr/share/wizvid/vendor'
+
+
+def _ytdlp_user_vendor_dir():
+    """User-writable yt-dlp location; the launcher prefers it when present."""
+    return os.path.join(os.path.expanduser('~'), '.local', 'share', 'wizvid', 'vendor')
+
+
+def _ytdlp_is_system_bundled():
+    """True when the loaded yt-dlp came from the packaged vendor directory."""
+    return os.path.abspath(yt_dlp.__file__).startswith(
+        os.path.abspath(_ytdlp_system_vendor_dir()) + os.sep)
+
+
 class YtDlpUpdateWorker(QObject):
     """Checks PyPI for the latest yt-dlp version and upgrades if needed."""
     status = pyqtSignal(str)
@@ -69,10 +85,20 @@ class YtDlpUpdateWorker(QObject):
             )
             self.update_found.emit(current_version, latest_version)
 
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
-                capture_output=True, text=True
-            )
+            if _ytdlp_is_system_bundled():
+                # /usr/share is not writable and the system python is PEP 668
+                # managed, so install into the user vendor dir instead. The
+                # launcher puts that dir on PYTHONPATH ahead of the bundled copy.
+                target = _ytdlp_user_vendor_dir()
+                self.status.emit(f"Installing yt-dlp {latest_version} into {target} ...")
+                shutil.rmtree(target, ignore_errors=True)
+                cmd = [sys.executable, "-m", "pip", "install", "--quiet",
+                       "--upgrade", "--target", target, "--no-deps",
+                       f"yt-dlp=={latest_version}"]
+            else:
+                cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
                 self.status.emit(f"yt-dlp updated to {latest_version} successfully!")
                 self.update_done.emit(latest_version)
